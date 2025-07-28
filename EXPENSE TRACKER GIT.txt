@@ -1,0 +1,1075 @@
+/*********************
+ * CONFIGURATION
+ *********************/
+const LABEL_NAME = "1099expense";
+const HANDLED_LABEL_NAME = `${LABEL_NAME}_done`;
+const SPREADSHEET_URL = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+const SHEET_NAME = "All Business Expenses";
+const DRIVE_RECEIPTS_FOLDER = "1099 Receipts";
+const PHONE_NUMBER = "XXXXXXXXXX"; 
+const TWILIO_ACCOUNT_SID = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX";
+const TWILIO_AUTH_TOKEN = "XXXXXXXXXXXXXXXXXXXXXXXXXXXXXXXX"; 
+const TWILIO_PHONE_NUMBER = "XXXXXXXXXX";
+
+
+/*********************
+ *********************************************************** MAIN FUNCTIONS **********************************************************
+ *********************/
+function main() {
+  // record start time of execution for performance tracking
+  const executionStart = new Date();
+  console.log('Starting 1099 Expense Processor at', executionStart.toISOString());
+  
+  try {
+    // object to track success/failure of each operation ---------------> TRACK SUCCESS/FAILURE
+    const results = {
+      labels: false,
+      emails: false,
+      charts: false,
+      limits: false
+    };
+    // --------------->--------------->--------------->---------------> TRY CATCH BLOCKS TO TRACK SUCCESS/FAILURE
+    // try creating gmail labels with error handling   ---------------> CREATE LABELS
+    try {
+      create1099ExpenseLabels();
+      results.labels = true;
+    } catch (error) {
+      console.error('Label operation failed:', error);
+    }
+
+    // try processing expense emails with error handling ---------------> PROCESS EMAILS
+    try {
+      processExpenseEmails();
+      results.emails = true;
+    } catch (error) {
+      console.error('Email processing failed:', error);
+    }
+
+    // only create charts if email processing succeeded ---------------> CHART IF PROCESSED EMAILS
+    if (results.emails) {
+      try {
+        createCategoryPieChart();
+        results.charts = true;
+      } catch (error) {
+        console.error('Chart creation failed:', error);
+      }
+
+      try {
+        createDailyExpenditureChart();
+      } catch (error) {
+        console.error('Daily chart failed:', error);
+      }
+    }
+
+    // check expenditure limits with error handling ---------------> CHECK EXPENDITURE LIMITS
+    try {
+      checkExpenditureLimits();
+      results.limits = true;
+    } catch (error) {
+      console.error('Limit check failed:', error);
+    }
+
+    // log final results of all operations
+    console.log('Processing completed with results:', JSON.stringify(results));
+    
+    // only send error notification if critical operations failed
+    // if (!results.emails || !results.totals) {
+    //   throw new Error(`Critical operations failed: ${JSON.stringify(results)}`);
+    // }
+    if (!results.emails) {
+      throw new Error(`Critical operations failed: ${JSON.stringify(results)}`);
+    }
+  } catch (error) {
+    // handle any uncaught errors in main process
+    console.error('Error in main:', error);
+    sendErrorNotification(error);
+  } finally {
+    // calculate and log total execution time
+    const duration = (new Date() - executionStart) / 1000;
+    console.log(`Execution completed in ${duration} seconds`);
+  }
+}
+
+/*********************
+ ********************************************************** LABEL MANAGEMENT **********************************************************
+ *********************/
+// function to create both gmail labels if they don't exist ---------------> CREATE LABELS (FUNC)
+function create1099ExpenseLabels() {
+  createLabelIfNotExists(LABEL_NAME);
+  createLabelIfNotExists(HANDLED_LABEL_NAME);
+}
+
+// helper function to create a single gmail label if it doesn't exist
+function createLabelIfNotExists(labelName) {
+  try {
+    // ---VALIDATE--- label name is not empty and is string ---------------> VALIDATE LABEL NAME
+    if (!labelName || typeof labelName !== 'string') {
+      throw new Error('Invalid label name');
+    }
+    
+    // ---CLEAN--- label name by trimming whitespace ---------------> CLEAN LABEL NAME
+    const cleanLabelName = labelName.trim();
+    // check if label already exists
+    let label = GmailApp.getUserLabelByName(cleanLabelName);
+    
+    // ---CREATE--- label if it doesn't exist ---------------> CREATE LABEL NAME
+    if (!label) {
+      console.log(`Creating label: ${cleanLabelName}`);
+      label = GmailApp.createLabel(cleanLabelName);
+      // small delay to avoid rate limiting
+      Utilities.sleep(500);
+    }
+    return label;
+  } catch (error) {
+    console.error(`Label error: ${error.message}`);
+    throw error;
+  }
+}
+
+/*********************
+ *********************************************************** EMAIL PROCESSING **********************************************************
+ *********************/
+// main function to process all emails with expense label ---------------> PROCESS EMAILS (FUNC)
+function processExpenseEmails() {
+  // get gmail labels for unprocessed and processed emails
+  const label = GmailApp.getUserLabelByName(LABEL_NAME);
+  const handledLabel = GmailApp.getUserLabelByName(HANDLED_LABEL_NAME);
+  // get all email threads with the unprocessed label
+  const expenseThreads = label.getThreads(); //---------------> PROCESS EMAILS WITH LABEL 1099EXPENSE
+  
+  // EXIT if NO labeled emails found
+  if (expenseThreads.length === 0) {
+    console.log('No labeled emails found');
+    return;
+  }
+
+  // get or create receipts folder in google drive ---------------> CREATE RECEIPT FOLDER IN DRIVE
+  const receiptFolder = getOrCreateReceiptsFolder();
+  // load reference data from spreadsheet
+  const { categories, paymentMethods } = loadReferenceData();
+  
+  // array to store successfully processed threads
+  const completeThreads = [];
+  
+  // process each email thread
+  for (const thread of expenseThreads) {
+    try {
+      // get first message in thread (assuming single message)
+      const message = thread.getMessages()[0];
+      // extract basic message info
+      const { subject, date, id } = extractMessageInfo(message); //---------------> EXTRACT EMAIL INFO - subject, date, id
+      
+      // parse expense details from subject line
+      const {
+        amount,
+        category,
+        merchant,
+        paymentMethod,
+        notes
+      } = parseExpenseSubject(subject, categories, paymentMethods);
+      
+      // process any attachments and save to drive
+      const attachments = processAttachments(message, receiptFolder, id, date); //---------------> SAVE ATTACHMENTS TO DRIVE
+      
+      // ---------------> save expense data to spreadsheet (func below, do ctrl+f)
+      saveExpenseToSheet({
+        date,
+        amount,
+        category,
+        merchant,
+        paymentMethod,
+        notes,
+        emailId: id,
+        attachments
+      });
+      
+      // add thread to list of completed threads
+      completeThreads.push(thread); 
+    } catch (error) {
+      console.error(`Error processing thread: ${error.message}`);
+    }
+  }
+  
+  // update labels for processed threads
+  updateLabels(completeThreads, label, handledLabel); //---------------> MARK AS COMPLETED/ CHANGE LABEL
+}
+
+/*********************
+ *********************************************************** DATA PROCESSING **********************************************************
+ *********************/
+// ---------------> extract basic info from email message
+function extractMessageInfo(message) {
+  return {
+    subject: message.getSubject(), // email subject line
+    date: message.getDate(), // date email was received
+    id: message.getId() // unique gmail message id
+  };
+}
+
+// parse expense details from email subject line ---------------> PARSE EXPENSE DETAILS FROM SUBJECT
+function parseExpenseSubject(subject, categories, paymentMethods) {
+  // clean subject by removing reply/forward prefixes and trimming whitespace //---------------> TRIM AND CLEAN
+  const cleanSubject = subject
+    .replace(/^(Fwd:|Re:|\[.*?\])/i, '')
+    .trim();
+  
+  // split subject into parts using common separators
+  const parts = cleanSubject.split(/[-:|]/).map(part => part.trim()); //---------------> SPLIT
+  
+  // extract amount (must be first part of subject)
+  const amountMatch = cleanSubject.match(/^\s*([0-9]+(?:\.[0-9]+)?)/);
+  // ^\s* - Skips any leading spaces
+  // ([0-9]+ - Matches 1+ digits (whole number part)
+  // (?:\.[0-9]+)?) - Optionally matches decimal point + digits
+  if (!amountMatch) throw new Error(`No amount found in: ${subject}`);
+  const amount = parseFloat(amountMatch[1]); //---------------> AMOUNT
+  
+  //---------------> DEFAULT VALUES if parts not found
+  let category = "Other Expenses";
+  let merchant = "Unknown Merchant";
+  let paymentMethod = "Unknown";
+  let notes = "";
+  
+  // determine category from subject (validate against reference list)
+  if (parts.length > 1) {
+    const requestedCategory = parts[1]; //---------------> FIND CATEGORY
+    category = categories.includes(requestedCategory) 
+      ? requestedCategory 
+      : findClosestCategory(requestedCategory, categories);
+  }
+  
+  // get merchant from subject if exists
+  if (parts.length > 2) merchant = parts[2]; //---------------> FIND MERCHANT
+  
+  // get payment method from subject if exists
+  if (parts.length > 3) {
+    const pmCode = parts[3].toLowerCase();
+    paymentMethod = paymentMethods[pmCode] || parts[3]; //---------------> FIND PAYMENT METHOD
+  }
+  
+  // combine remaining parts as notes
+  if (parts.length > 4) notes = parts.slice(4).join(' - '); //---------------> REMAINING IS NOTES
+  
+  return {
+    amount,
+    category,
+    merchant,
+    paymentMethod,
+    notes
+  };
+}
+
+// find closest matching category using synonyms and fuzzy matching ---------------> CLOSEST MATCH FOR CATEGORY
+function findClosestCategory(input, categories) {
+  const lowerInput = input.toLowerCase().trim();
+  
+  // first try exact match (case insensitive)
+  const exactMatch = categories.find(cat => cat.toLowerCase() === lowerInput);
+  if (exactMatch) return exactMatch;
+
+  // synonym mapping for common variations
+  const synonymMap = {
+    // Advertising
+    'ad': 'Advertising',
+    'marketing': 'Advertising',
+    'promotion': 'Advertising',
+    'social media': 'Advertising',
+    'google ads': 'Advertising',
+    'facebook ads': 'Advertising',
+    'seo': 'Advertising',
+
+    // Car and Truck Expenses
+    'vehicle': 'Car and Truck Expenses',
+    'gas': 'Car and Truck Expenses',
+    'mileage': 'Car and Truck Expenses',
+    'auto': 'Car and Truck Expenses',
+    'maintenance': 'Car and Truck Expenses',
+    'fuel': 'Car and Truck Expenses',
+    'insurance': 'Car and Truck Expenses',
+
+    // Commissions and Fees
+    'referral': 'Commissions and Fees',
+    'broker': 'Commissions and Fees',
+    'agent': 'Commissions and Fees',
+    'royalty': 'Commissions and Fees',
+    'licensing': 'Commissions and Fees',
+    'credit card fee': 'Commissions and Fees',
+    'payment processing': 'Commissions and Fees',
+
+    // Contract Labor
+    'contractor': 'Contract Labor',
+    'freelancer': 'Contract Labor',
+    'consultant': 'Contract Labor',
+    'developer': 'Contract Labor',
+    'designer': 'Contract Labor',
+    'programmer': 'Contract Labor',
+    'temp': 'Contract Labor',
+
+    // Depreciation
+    'amortization': 'Depreciation',
+    'equipment loss': 'Depreciation',
+    'asset': 'Depreciation',
+    'capital': 'Depreciation',
+    'write-off': 'Depreciation',
+    'value reduction': 'Depreciation',
+
+    // Meals & Entertainment
+    'meal': 'Meals & Entertainment',
+    'lunch': 'Meals & Entertainment',
+    'dinner': 'Meals & Entertainment',
+    'client dinner': 'Meals & Entertainment',
+    'business meal': 'Meals & Entertainment',
+    'restaurant': 'Meals & Entertainment',
+    'food': 'Meals & Entertainment',
+
+    // Office Expenses
+    'supply': 'Office Expenses',
+    'stationery': 'Office Expenses',
+    'software': 'Office Expenses',
+    'subscription': 'Office Expenses',
+    'printer': 'Office Expenses',
+    'ink': 'Office Expenses',
+    'postage': 'Office Expenses',
+
+    // Rent or Lease
+    'office space': 'Rent or Lease',
+    'equipment rental': 'Rent or Lease',
+    'lease payment': 'Rent or Lease',
+    'property': 'Rent or Lease',
+    'warehouse': 'Rent or Lease',
+    'storage': 'Rent or Lease',
+    'apartment': 'Rent or Lease',
+
+    // Repairs and Maintenance
+    'fix': 'Repairs and Maintenance',
+    'service': 'Repairs and Maintenance',
+    'upkeep': 'Repairs and Maintenance',
+    'technician': 'Repairs and Maintenance',
+    'handyman': 'Repairs and Maintenance',
+    'plumber': 'Repairs and Maintenance',
+    'electrician': 'Repairs and Maintenance',
+
+    // Supplies
+    'material': 'Supplies',
+    'equipment': 'Supplies',
+    'tools': 'Supplies',
+    'consumables': 'Supplies',
+    'inventory': 'Supplies',
+    'parts': 'Supplies',
+    'raw materials': 'Supplies',
+
+    // Travel
+    'hotel': 'Travel',
+    'flight': 'Travel',
+    'transportation': 'Travel',
+    'uber': 'Travel',
+    'lyft': 'Travel',
+    'conference': 'Travel',
+    'lodging': 'Travel',
+
+    // Utilities
+    'electric': 'Utilities',
+    'water': 'Utilities',
+    'gas bill': 'Utilities',
+    'internet': 'Utilities',
+    'phone': 'Utilities',
+    'cable': 'Utilities',
+    'wifi': 'Utilities',
+
+    // Wages
+    'payroll': 'Wages',
+    'employee': 'Wages',
+    'salary': 'Wages',
+    'staff': 'Wages',
+    'labor': 'Wages',
+    'bonus': 'Wages',
+    'overtime': 'Wages'
+  };
+
+  // check if input contains any synonym
+  for (const [keyword, category] of Object.entries(synonymMap)) {
+    if (lowerInput.includes(keyword)) {
+      return category;
+    }
+  }
+
+  // try matching the beginning of category names
+  const startsWithMatch = categories.find(cat => 
+    cat.toLowerCase().startsWith(lowerInput) || 
+    lowerInput.startsWith(cat.toLowerCase())
+  );
+  if (startsWithMatch) return startsWithMatch;
+  
+  // final fallback category if no matches found
+  return "Other Expenses";
+}
+
+/*********************
+ *********************************************************** ATTACHMENT HANDLING **********************************************************
+ *********************/
+// get or create receipts folder in google drive ---------------> RECEIPTS FOLDER IN DRIVE
+function getOrCreateReceiptsFolder() {
+  const folders = DriveApp.getFoldersByName(DRIVE_RECEIPTS_FOLDER);
+  //hasNext() == true → Folder exists (returns the first match with next()).
+  return folders.hasNext() 
+    ? folders.next() 
+    : DriveApp.createFolder(DRIVE_RECEIPTS_FOLDER);
+}
+
+// process email attachments and save to drive //---------------> SAVE ATTACHMENT TO DRIVE
+function processAttachments(message, parentFolder, emailId, date) {
+  // get all attachments from email
+  const attachments = message.getAttachments();
+  if (attachments.length === 0) return [];
+  
+  // create subfolder with date and email id prefix //---------------> SUBFOLDER: DATE_EMAILIDPREFIX
+  const dateStr = Utilities.formatDate(date, Session.getScriptTimeZone(), "yyyy-MM-dd");
+  const subFolderName = `${dateStr}_${emailId.slice(0, 8)}`;
+  const subFolder = parentFolder.createFolder(subFolderName);
+  
+  // process each attachment
+  return attachments.map((attachment, i) => {
+    try {
+      const fileName = `Receipt_${dateStr}_${i + 1}.${getFileExtension(attachment)}`; //---------------> CREATE STANDARDIZED FILE NAME
+      const file = subFolder.createFile(attachment); //---------------> SAVE FILE TO DRIVE
+      file.setName(fileName);
+      return file.getUrl();
+    } catch (error) {
+      console.error(`Error saving attachment: ${error}`);
+      return null;
+    }
+  }).filter(url => url !== null); // filter out failed saves
+}
+
+// get file extension from attachment name //---------------> FIND EXTENSION OF FILE AFTER DOT(.PDF)
+function getFileExtension(attachment) {
+  const name = attachment.getName();
+  const lastDot = name.lastIndexOf('.');
+  return lastDot === -1 ? '' : name.slice(lastDot + 1);
+}
+
+/*********************
+ *********************************************************** DATA SAVING **********************************************************
+ *********************/
+
+// load reference data (categories and payment methods) from spreadsheet //---------------> LOAD REFERENCE DATA WITH ERROR HANDLING
+function loadReferenceData() {
+  return withRetry(() => {
+    const spreadsheet = SpreadsheetApp.openByUrl(SPREADSHEET_URL);
+    
+  // load categories from Categories sheet
+    let categories = [];
+    try {
+      const categoriesSheet = spreadsheet.getSheetByName("Categories");
+      if (categoriesSheet) {
+        categories = categoriesSheet.getRange(2, 1, categoriesSheet.getLastRow() - 1, 1)
+          .getValues()
+          .flat()
+          .filter(Boolean);
+      }
+        // 2 = Start from row 2 (skipping header row)
+        // 1 = Column A (first column)
+        // categoriesSheet.getLastRow() - 1 = Number of rows to get 
+        //   (total rows - 1 because we're skipping header)
+        // 1 = Get only 1 column width (just column A)
+    } catch (error) {
+      console.error('Error loading categories:', error);
+      categories = ["Other Expenses"]; // default fallback
+    }
+    
+  // load payment methods from PaymentMethods sheet //---------------> FROM THE PAYMENT METHODS SHEET
+    const paymentMethods = {};
+    try {
+      const pmSheet = spreadsheet.getSheetByName("PaymentMethods");
+      if (pmSheet) {
+        pmSheet.getRange(2, 1, pmSheet.getLastRow() - 1, 2)
+          .getValues()
+          .forEach(([code, method]) => {
+            if (code && method) {
+              paymentMethods[code.toLowerCase()] = method;
+            }
+          });
+      }
+    } catch (error) {
+      console.error('Error loading payment methods:', error);
+      // default fallbacks
+      paymentMethods['cash'] = 'Cash';
+      paymentMethods['card'] = 'Credit/Debit Card';
+    }
+    
+    return { categories, paymentMethods };
+  });
+}
+
+
+// // load reference data (categories and payment methods) from spreadsheet //---------------> LOAD REFERENCE DATA WITHOUT ERROR HANDLING
+// function loadReferenceData() {
+//   const spreadsheet = SpreadsheetApp.openByUrl(SPREADSHEET_URL);
+  
+//   // load categories from Categories sheet
+//   const categoriesSheet = spreadsheet.getSheetByName("Categories"); //---------------> FROM THE CATEGORIES SHEET
+//   const categories = categoriesSheet.getRange(2, 1, categoriesSheet.getLastRow() - 1, 1)
+//     .getValues()
+//     .flat()
+//     .filter(Boolean);
+//   // 2 = Start from row 2 (skipping header row)
+//   // 1 = Column A (first column)
+//   // categoriesSheet.getLastRow() - 1 = Number of rows to get 
+//   //   (total rows - 1 because we're skipping header)
+//   // 1 = Get only 1 column width (just column A)
+  
+//   // load payment methods from PaymentMethods sheet
+//   const pmSheet = spreadsheet.getSheetByName("PaymentMethods"); //---------------> FROM THE PAYMENT METHODS SHEET
+//   const paymentMethods = {};
+//   pmSheet.getRange(2, 1, pmSheet.getLastRow() - 1, 2)
+//     .getValues()
+//     .forEach(([code, method]) => {
+//       paymentMethods[code.toLowerCase()] = method;
+//     });
+  
+//   return { categories, paymentMethods };
+// }
+
+
+// helper function to retry spreadsheet operations cuz error //---------------> RETRY SPREADSHEET OPERATIONS (PASSED FROM NEXT FUNCTION)
+function withRetry(spreadsheetOperation, maxRetries = 3, delayMs = 1000) {
+  for (let attempt = 1; attempt <= maxRetries; attempt++) {
+    try {
+      return spreadsheetOperation();
+    } catch (error) {
+      if (attempt === maxRetries) throw error;
+      Utilities.sleep(delayMs * attempt); // exponential backoff
+    }
+  }
+}
+
+
+// save expense data to spreadsheet with retry 
+function saveExpenseToSheet(params) {
+  return withRetry(() => {
+    const {date, amount, category, merchant, paymentMethod, notes, emailId, attachments} = params; //OF NEW ROW
+    
+    const sheet = SpreadsheetApp.openByUrl(SPREADSHEET_URL).getSheetByName(SHEET_NAME);
+    const lastRow = sheet.getLastRow();
+    
+    // 1. get previous total (0 if first data row) //---------------> FOR THE RUNNING TOTAL
+    const prevTotal = lastRow <= 1 ? 0 : sheet.getRange(lastRow, 10).getValue();
+    
+    // 2. calculate new running total
+    const newTotal = prevTotal + amount;
+    
+    // 3. //---------------> NOW APPEND NEW ROW with all expense data 
+    sheet.appendRow([
+      Utilities.formatDate(date, Session.getScriptTimeZone(), "yyyy-MM-dd"), // formatted date
+      Utilities.formatDate(date, Session.getScriptTimeZone(), "HH:mm:ss"), // formatted time
+      merchant, // merchant name
+      amount.toFixed(2), // amount with 2 decimal places
+      category, // expense category
+      paymentMethod, // payment method
+      `=HYPERLINK("https://mail.google.com/mail/u/0/#inbox/${emailId}","View Email")`, // link to original email
+      attachments.map(url => `=HYPERLINK("${url}","Receipt")`).join(", ") || "No receipts", // links to receipts
+      notes, // additional notes
+      newTotal.toFixed(2) // running total
+    ]);
+    
+    // add small delay after writing to avoid rate limiting
+    Utilities.sleep(500);
+    
+    return true;
+  });
+}
+
+/*********************
+ *********************************************************** SMS NOTIFICATION **********************************************************
+ *********************/
+// send sms notification about recorded expense 
+function sendExpenseNotificationSMS(expenseDetails) { //---------------> FOR SMS
+  try {
+    if (!expenseDetails) {
+      console.log('No expense details provided for SMS notification');
+      return;
+    }
+    
+    // //---------------> EXTRACT expense details
+    const { date, amount, category, merchant, monthlyTotal } = expenseDetails;
+    // format date for display
+    const formattedDate = Utilities.formatDate(date, Session.getScriptTimeZone(), "MMM dd, yyyy");
+    
+    // //---------------> CONSTRUCT BODY- sms message body
+    const messageBody = `Expense Recorded: ${formattedDate}\n` +
+                       `Amount: $${parseFloat(amount).toFixed(2)}\n` +
+                       `Category: ${category}\n` +
+                       `Merchant: ${merchant}\n` +
+                       `Monthly Running Total: $${parseFloat(monthlyTotal).toFixed(2)}\n\n` +
+                       `This expense has been successfully tracked in your expense system.`;
+    
+    // twilio api endpoint
+    const twilioUrl = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`;
+    
+    // sms payload
+    const payload = {
+      "To": PHONE_NUMBER,
+      "From": TWILIO_PHONE_NUMBER,
+      "Body": messageBody
+    };
+    
+    // request options with auth header
+    const options = {
+      "method": "post",
+      "headers": {
+        "Authorization": "Basic " + Utilities.base64Encode(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`)
+      },
+      "payload": payload
+    };
+    
+    // send sms via twilio api
+    const response = UrlFetchApp.fetch(twilioUrl, options);
+    console.log('SMS sent successfully:', response.getContentText());
+  } catch (error) {
+    console.error('Error sending SMS notification:', error);
+  }
+}
+
+/*********************
+ *********************************************************** CHART MANAGEMENT FUNCTIONS **********************************************************
+ *********************/
+
+// chart positions configuration //---------------> CHART POSITIONS
+const CHART_POSITIONS = {
+  PIE: { col: 12, row: 2 },    // column L, row 2 for pie chart
+  DAILY: { col: 19, row: 2 }   // column S, row 2 for daily chart
+};
+
+// helper function to update or create chart in specified position  //---------------> PUT CHARGE IN POSITION
+function updateOrCreateChart(chartType, chartBuilder) {
+  const sheet = SpreadsheetApp.openByUrl(SPREADSHEET_URL).getSheetByName(SHEET_NAME);
+  const charts = sheet.getCharts();
+  const position = CHART_POSITIONS[chartType];
+  
+  // FIND EXISTING chart in the target position
+  const existingChart = charts.find(chart => {
+    const chartPosition = chart.getContainerInfo().getAnchorCell();
+    return (
+      chartPosition.getColumn() === position.col &&
+      chartPosition.getRow() === position.row
+    );
+  });
+  
+  // REMOVE EXISTING chart if found
+  if (existingChart) {
+    sheet.removeChart(existingChart);
+  }
+  
+  // CREATE NEW and position new chart
+  const newChart = chartBuilder
+    .setPosition(position.row, position.col, 0, 0)
+    .build();
+  
+  sheet.insertChart(newChart);
+  return newChart;
+}
+
+/*********************
+ *********************************************************** CLEANUP FUNCTION **********************************************************
+ *********************/
+
+// remove duplicate charts from spreadsheet
+function removeDuplicateCharts() { //---------------> WEEKLY - CLEAR ANY DUPLICATES 
+  try {
+    const sheet = SpreadsheetApp.openByUrl(SPREADSHEET_URL).getSheetByName(SHEET_NAME);
+    const charts = sheet.getCharts();
+    const keptCharts = [];
+    
+    // find which charts to keep (one of each type in correct position) //---------------> KEEP 1 OF EACH TYPE AT EACH POSITION
+    Object.entries(CHART_POSITIONS).forEach(([type, position]) => {
+      const chartInPosition = charts.find(chart => {
+        const chartPos = chart.getContainerInfo().getAnchorCell();
+        return (
+          chartPos.getColumn() === position.col &&
+          chartPos.getRow() === position.row
+        );
+      });
+      
+      if (chartInPosition) { 
+        keptCharts.push(chartInPosition); 
+      }
+    });
+    
+    // remove all charts except the ones we're keeping //---------------> REMOVE ALL EXCEPT THIS 1
+    charts.forEach(chart => {
+      if (!keptCharts.includes(chart)) {
+        sheet.removeChart(chart);
+      }
+    });
+    
+    console.log(`Removed ${charts.length - keptCharts.length} duplicate charts`);
+  } catch (error) {
+    console.error('Error cleaning up charts:', error);
+  }
+}
+
+/*********************
+ *********************************************************** CHART FUNCTIONS **********************************************************
+ *********************/
+
+// create pie chart showing expenses by category
+function createCategoryPieChart() { //---------------> PIE CHART
+  try {
+    console.log('Creating category pie chart with proper grouping');
+    
+    const spreadsheet = SpreadsheetApp.openByUrl(SPREADSHEET_URL);
+    const sheet = spreadsheet.getSheetByName(SHEET_NAME);
+    const lastRow = sheet.getLastRow();
+    
+    if (lastRow <= 1) {
+      console.log('No data available for chart');
+      return;
+    }
+
+    // get all expense data at once (rows 2 to lastRow, columns A-J) //---------------> ALL EXPENSE DATA
+    const data = sheet.getRange(2, 1, lastRow-1, 10).getValues();
+    
+    // create map of categories with summed amounts //---------------> TO GROUP BY CATEGORY
+    const categoryMap = {}; 
+    data.forEach(row => {
+      const amount = parseFloat(row[3]) || 0; // column D (amount) row ke andar 3rd pos
+      const category = row[4].toString().trim(); // column E (category)
+      // Processes each row to:
+      // Extract the amount (from column D) and convert to number
+      // Extract the category (from column E) and clean it
+
+      if (category) {
+        categoryMap[category] = (categoryMap[category] || 0) + amount; //---------------> AND SUM AFTER GROUPING
+      }
+      // Sums amounts by category in categoryMap:
+      // Creates keys for each unique category
+      // Accumulates the total amount for each category
+    });
+
+    // convert to array for sorting
+    const chartData = Object.entries(categoryMap).map(([category, amount]) => [category, amount]);
+    
+    // SORT BY AMOUNT (descending)
+    chartData.sort((a, b) => b[1] - a[1]);
+    
+    // add headers
+    chartData.unshift(['Category', 'Amount']);
+
+    // create new sheet for chart data //---------------> TEMP SHEET STORAGE FOR PIE CHART DATA
+    let chartSheet = spreadsheet.getSheetByName('ChartData');
+    if (!chartSheet) {
+      chartSheet = spreadsheet.insertSheet('ChartData');
+    } else {
+      chartSheet.clear();
+    }
+
+    // write the data
+    chartSheet.getRange(1, 1, chartData.length, 2).setValues(chartData);
+    
+    // //---------------> CREATE the pie chart 
+    const pieChart = chartSheet.newChart()
+      .setChartType(Charts.ChartType.PIE)
+      .addRange(chartSheet.getRange(1, 1, chartData.length, 2))
+      .setOption('title', 'Expenses by Category')
+      .setOption('pieHole', 0.4) // donut chart style
+      .setOption('width', 500)
+      .setOption('height', 400)
+      .setOption('pieSliceText', 'value')
+      .setOption('legend.position', 'right')
+      .setOption('colors', ['#3366CC', '#DC3912', '#FF9900', '#109618', '#990099', '#0099C6'])
+      .build();
+
+    // //---------------> REMOVE OLD CHART from main sheet
+    const charts = sheet.getCharts();
+    charts.forEach(chart => {
+      if (chart.getOptions().get('title') === 'Expenses by Category') {
+        sheet.removeChart(chart);
+      }
+    });
+
+    // //---------------> ADD TO MAIN sheet at defined position
+    const position = CHART_POSITIONS.PIE;
+    sheet.insertChart(
+      pieChart.modify()
+        .setPosition(position.row, position.col, 0, 0)
+        .build()
+    );
+
+    //---------------> hide the data sheet
+    chartSheet.hideSheet();
+    
+    console.log('Pie chart successfully created with grouped categories');
+    return true;
+    
+  } catch (error) {
+    console.error('Failed to create pie chart:', error);
+    sendErrorNotification(error);
+    return false;
+  }
+}
+
+// create line chart showing daily expenditure
+function createDailyExpenditureChart() { //---------------> DAILY EXPENSE LINE CHART
+  try {
+    console.log('Creating daily expenditure chart with proper grouping');
+    
+    const spreadsheet = SpreadsheetApp.openByUrl(SPREADSHEET_URL);
+    const sheet = spreadsheet.getSheetByName(SHEET_NAME);
+    const lastRow = sheet.getLastRow();
+    
+    if (lastRow <= 1) {
+      console.log('No data available for daily chart');
+      return;
+    }
+
+    // get all expense data at once //---------------> GET ALL DATA 
+    const data = sheet.getRange(2, 1, lastRow-1, 4).getValues();
+    
+    // //---------------> create map of dates with summed amounts
+    const dateMap = {};
+    data.forEach(row => {
+      const date = row[0]; // column A (date)
+      const amount = parseFloat(row[3]) || 0; // column D (amount)
+      
+      if (date instanceof Date && !isNaN(date)) {
+        const dateKey = Utilities.formatDate(date, Session.getScriptTimeZone(), "yyyy-MM-dd");
+        dateMap[dateKey] = (dateMap[dateKey] || 0) + amount; //---------------> MAP DATE WITH AMOUNT AND KEEP ADDING AMOUNT
+      }
+    });
+
+    // convert to array and sort by date
+    const chartData = Object.entries(dateMap).map(([date, amount]) => [new Date(date), amount]);
+    chartData.sort((a, b) => a[0] - b[0]); // sort chronologically
+    
+    // add headers
+    chartData.unshift(['Date', 'Amount']);
+
+    // create or clear the chart data sheet //---------------> TEMP STORAGE SHEET
+    let chartSheet = spreadsheet.getSheetByName('DailyChartData');
+    if (!chartSheet) {
+      chartSheet = spreadsheet.insertSheet('DailyChartData');
+    } else {
+      chartSheet.clear();
+    }
+
+    // write the data
+    chartSheet.getRange(1, 1, chartData.length, 2).setValues(chartData);
+    
+    // //---------------> CREATE the line chart with formatting
+    const lineChart = chartSheet.newChart()
+      .setChartType(Charts.ChartType.LINE)
+      .addRange(chartSheet.getRange(1, 1, chartData.length, 2))
+      .setOption('title', 'Daily Expenditure (Summed)')
+      .setOption('hAxis.title', 'Date')
+      .setOption('vAxis.title', 'Amount ($)')
+      .setOption('width', 600)
+      .setOption('height', 400)
+      .setOption('legend.position', 'none')
+      .setOption('colors', ['#3366CC'])
+      .setOption('curveType', 'function') // smooth lines
+      .setOption('hAxis.format', 'MMM d') // formatted dates
+      .setOption('vAxis.format', '$#,##0') // currency format
+      .build();
+
+    // //---------------> REMOVE OLD chart from main sheet
+    const charts = sheet.getCharts();
+    charts.forEach(chart => {
+      if (chart.getOptions().get('title') === 'Daily Expenditure' || 
+          chart.getOptions().get('title') === 'Daily Expenditure (Summed)') {
+        sheet.removeChart(chart);
+      }
+    });
+
+    // //---------------> ADD TO MAIN sheet at defined position
+    const position = CHART_POSITIONS.DAILY;
+    sheet.insertChart(
+      lineChart.modify()
+        .setPosition(position.row, position.col, 0, 0)
+        .build()
+    );
+
+    // hide the data sheet (optional)
+    chartSheet.hideSheet();
+    
+    console.log('Daily expenditure chart successfully created with summed data');
+    return true;
+    
+  } catch (error) {
+    console.error('Failed to create daily expenditure chart:', error);
+    sendErrorNotification(error);
+    return false;
+  }
+}
+
+/*********************
+ *********************************************************** UTILITIES **********************************************************
+ *********************/
+
+// update gmail labels for processed threads //---------------> UPDATE LABELS FOR AFTER PROCESSING 
+function updateLabels(threads, originalLabel, handledLabel) {
+  if (threads.length === 0) return;
+  
+  // remove original label and add processed label
+  originalLabel.removeFromThreads(threads);
+  handledLabel.addToThreads(threads);
+}
+
+// send error notification via email
+function sendErrorNotification(error) {
+  const recipient = Session.getEffectiveUser().getEmail();
+  const subject = "1099 Expense Script Failed";
+  const body = `
+    Error in 1099 Expense Processing:
+    ${error.message}
+    
+    Stack Trace:
+    ${error.stack}
+  `;
+  
+  MailApp.sendEmail(recipient, subject, body);
+}
+
+// optimize spreadsheet by removing old charts
+// function optimizeSpreadsheet() {
+//   try {
+//     const spreadsheet = SpreadsheetApp.openByUrl(SPREADSHEET_URL);
+//     // clear old charts from main sheet
+//     const mainSheet = spreadsheet.getSheetByName(SHEET_NAME);
+//     if (mainSheet) {
+//       mainSheet.getCharts().forEach(chart => mainSheet.removeChart(chart));
+//     }
+    
+//     console.log('Spreadsheet optimization completed');
+//   } catch (error) {
+//     console.error('Error during optimization:', error);
+//   }
+// }
+
+/*********************
+ *********************************************************** EXPENDITURE LIMIT ALERTS **********************************************************
+ *********************/
+// expenditure warning and critical limits
+const EXPENDITURE_WARNING_LIMIT = 3000; // first threshold
+const EXPENDITURE_CRITICAL_LIMIT = 5000; // second threshold
+const MONTHLY_BUDGET = 5000; // total monthly budget
+
+// check if expenditure has crossed warning/critical limits
+function checkExpenditureLimits() { //---------------> WARN ON LIMITS
+  try {
+    const sheet = SpreadsheetApp.openByUrl(SPREADSHEET_URL).getSheetByName(SHEET_NAME);
+    const lastRow = sheet.getLastRow();
+    
+    if (lastRow <= 1) return; // no data
+    
+    // get current month's running total from last entry //---------------> GET RUNNING TOTAL
+    const currentTotal = parseFloat(sheet.getRange(lastRow, 10).getValue());
+    
+    // check if we've crossed any thresholds //---------------> CHECK FOR VIOLATION 1ST BIG THEN SMALL
+    if (currentTotal > EXPENDITURE_CRITICAL_LIMIT) {
+      sendLimitNotification('critical', currentTotal);
+    } else if (currentTotal > EXPENDITURE_WARNING_LIMIT) {
+      sendLimitNotification('warning', currentTotal);
+    }
+  } catch (error) {
+    console.error('Error checking expenditure limits:', error);
+  }
+}
+
+// send notification when expenditure limits are crossed
+function sendLimitNotification(type, currentTotal) { //---------------> NOTIFICATION FUNCTION
+  const remaining = MONTHLY_BUDGET - currentTotal; //---------------> REMAINING
+  const now = new Date();
+  const monthYear = Utilities.formatDate(now, Session.getScriptTimeZone(), "MMMM yyyy"); //---------------> CURRENT MONTH AND YEAR
+  
+  let smsBody, emailSubject, emailBody;
+  
+  // different messages for critical vs warning //---------------> MESSAGE FORMAT:
+  if (type === 'critical') {
+    smsBody = `🚨 EXPENSE ALERT: You have EXCEEDED this month's (${monthYear}) expenditure limit! Current total: $${currentTotal.toFixed(2)}. Please spend mindfully.`;
+    emailSubject = `[URGENT] Monthly Expenditure Limit Exceeded (${monthYear})`;
+    emailBody = `
+      <h2>Expenditure Limit Exceeded</h2>
+      <p>Your spending for ${monthYear} has exceeded the limit of $${MONTHLY_BUDGET.toFixed(2)}.</p>
+      <p><strong>Current total:</strong> $${currentTotal.toFixed(2)}</p>
+      <p>Please review your expenses and spend mindfully for the rest of the month.</p>
+    `;
+  } else {
+    smsBody = `⚠️ EXPENSE WARNING: You have only $${remaining.toFixed(2)} left to spend this month (${monthYear}). Current total: $${currentTotal.toFixed(2)}.`;
+    emailSubject = `Monthly Expenditure Warning (${monthYear})`;
+    emailBody = `
+      <h2>Expenditure Approaching Limit</h2>
+      <p>Your spending for ${monthYear} is approaching the limit of $${MONTHLY_BUDGET.toFixed(2)}.</p>
+      <p><strong>Current total:</strong> $${currentTotal.toFixed(2)}</p>
+      <p><strong>Remaining budget:</strong> $${remaining.toFixed(2)}</p>
+      <p>Please plan your expenses accordingly.</p>
+    `;
+  }
+  
+  // send sms notification
+  sendCustomSMS(smsBody);
+  
+  // send email notification
+  const recipient = Session.getEffectiveUser().getEmail();
+  MailApp.sendEmail({
+    to: recipient,
+    subject: emailSubject,
+    htmlBody: emailBody
+  });
+}
+
+// helper function to send custom sms via twilio
+function sendCustomSMS(message) {
+  try {
+    const twilioUrl = `https://api.twilio.com/2010-04-01/Accounts/${TWILIO_ACCOUNT_SID}/Messages.json`;
+    
+    const payload = {
+      "To": PHONE_NUMBER,
+      "From": TWILIO_PHONE_NUMBER,
+      "Body": message
+    };
+    
+    const options = {
+      "method": "post",
+      "headers": {
+        "Authorization": "Basic " + Utilities.base64Encode(`${TWILIO_ACCOUNT_SID}:${TWILIO_AUTH_TOKEN}`)
+      },
+      "payload": payload
+    };
+    
+    UrlFetchApp.fetch(twilioUrl, options);
+    console.log('Limit notification SMS sent');
+  } catch (error) {
+    console.error('Error sending limit SMS:', error);
+  }
+}
+
+/*********************
+ *********************************************************** TRIGGERS **********************************************************
+ *********************/
+// time-based triggers for automated execution
+function createTimeDrivenTriggers() {
+  // delete existing triggers first
+  ScriptApp.getProjectTriggers().forEach(trigger => {
+    ScriptApp.deleteTrigger(trigger);
+  });
+
+  // main trigger - runs every 12 hours
+  ScriptApp.newTrigger('main')
+    .timeBased()
+    .everyHours(12)
+    .create();
+    
+  // optimization trigger - runs weekly on sunday at 3am
+  // ScriptApp.newTrigger('optimizeSpreadsheet')
+  //   .timeBased()
+  //   .everyWeeks(1)
+  //   .onWeekDay(ScriptApp.WeekDay.SUNDAY)
+  //   .atHour(3)
+  //   .create();
+    
+  // chart cleanup trigger - runs weekly
+  ScriptApp.newTrigger('removeDuplicateCharts')
+    .timeBased()
+    .everyDays(7)
+    .create();
+}
